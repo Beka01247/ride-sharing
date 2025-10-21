@@ -94,7 +94,7 @@ func (c *driverConsumer) handleTripAccepted(ctx context.Context, tripID string, 
 	}
 
 	if trip == nil {
-		return fmt.Errorf("Trip was not found %s", tripID)
+		return fmt.Errorf("trip was not found %s", tripID)
 	}
 
 	if err := c.service.UpdateTrip(ctx, tripID, "accepted", driver); err != nil {
