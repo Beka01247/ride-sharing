@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"ride-sharing/shared/contracts"
+	"ride-sharing/shared/tracing"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -69,24 +70,31 @@ func (r *RabbitMQ) ConsumeMessages(queueName string, handler MessageHandler) err
 		return err
 	}
 
-	ctx := context.Background()
-
 	go func() {
 		for msg := range msgs {
-			log.Printf("Received a message: %s", msg.Body)
+			if err := tracing.TracedConsumer(msg, func(ctx context.Context, d amqp.Delivery) error {
 
-			if err := handler(ctx, msg); err != nil {
-				log.Printf("ERROR: Failed to handle message: %v. Message body: %s", err, msg.Body)
+				log.Printf("Received a message: %s", msg.Body)
 
-				if nackErr := msg.Nack(false, false); nackErr != nil {
-					log.Printf("ERROR: Failed to Nack message: %v", nackErr)
+				if err := handler(ctx, msg); err != nil {
+					log.Printf("ERROR: Failed to handle message: %v. Message body: %s", err, msg.Body)
+					// Nack the message. Set requeue to false to avoid immediate redelivery loops.
+					// Consider a dead-letter exchange (DLQ) or a more sophisticated retry mechanism for production.
+					if nackErr := msg.Nack(false, false); nackErr != nil {
+						log.Printf("ERROR: Failed to Nack message: %v", nackErr)
+					}
+
+					return err
 				}
 
-				continue
-			}
+				// Only Ack if the handler succeeds
+				if ackErr := msg.Ack(false); ackErr != nil {
+					log.Printf("ERROR: Failed to Ack message: %v. Message body: %s", ackErr, msg.Body)
+				}
 
-			if ackErr := msg.Ack(false); ackErr != nil {
-				log.Printf("ERROR: Failed to Ack message: %v. Message body: %s", ackErr, msg.Body)
+				return nil
+			}); err != nil {
+				log.Printf("Error processing message: %v", err)
 			}
 		}
 	}()
@@ -102,16 +110,23 @@ func (r *RabbitMQ) PublishMessage(ctx context.Context, routingKey string, messag
 		return fmt.Errorf("failed to marshal message: %v", err)
 	}
 
+	msg := amqp.Publishing{
+		DeliveryMode: amqp.Persistent,
+		ContentType:  "application/json",
+		Body:         jsonMsg,
+	}
+
+	return tracing.TracedPublisher(ctx, TripExchange, routingKey, msg, r.publish)
+}
+
+func (r *RabbitMQ) publish(ctx context.Context, exchange, routingKey string, msg amqp.Publishing) error {
 	return r.Channel.PublishWithContext(ctx,
-		TripExchange, // exchange
-		routingKey,   // routing key
-		false,        // mandatory
-		false,        // immediate
-		amqp.Publishing{
-			ContentType:  "text/plain",
-			Body:         jsonMsg,
-			DeliveryMode: amqp.Persistent,
-		})
+		exchange,   // exchange
+		routingKey, // routing key
+		false,      // mandatory
+		false,      // immediate
+		msg,
+	)
 }
 
 func (r *RabbitMQ) setupExchangesAndQueues() error {
@@ -229,7 +244,6 @@ func (r *RabbitMQ) Close() {
 	if r.conn != nil {
 		r.conn.Close()
 	}
-
 	if r.Channel != nil {
 		r.Channel.Close()
 	}
